@@ -1,0 +1,2 @@
+add_executable(bench_append bench_append.cpp)
+target_link_libraries(bench_append PRIVATE llle benchmark::benchmark_main)
