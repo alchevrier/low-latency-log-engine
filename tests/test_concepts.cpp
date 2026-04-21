@@ -80,3 +80,19 @@ TEST(IsTriviallyCopyable, PassesForTrivialForPOD) {
 TEST(IsTriviallyCopyable, FailsForTypeWithDestructor) {
     EXPECT_FALSE(llle::IsTriviallyCopyable<TypeWithDestructor>);
 }
+
+TEST(IsHugePageAligned, FailsForZero) {
+    EXPECT_FALSE(llle::IsHugePageAligned<0>);
+}
+
+TEST(IsHugePageAligned, FailsForNotMultipleOfHugePage) {
+    EXPECT_FALSE(llle::IsHugePageAligned<2097151>);
+    EXPECT_FALSE(llle::IsHugePageAligned<3145728>);
+    EXPECT_FALSE(llle::IsHugePageAligned<1024>);
+}
+
+TEST(IsHugePageAligned, PassesForMultipleOfHugePage) {
+    EXPECT_TRUE(llle::IsHugePageAligned<2097152>);
+    EXPECT_TRUE(llle::IsHugePageAligned<4194304>);
+    EXPECT_TRUE(llle::IsHugePageAligned<1073741824>);
+}
