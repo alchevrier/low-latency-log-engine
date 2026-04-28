@@ -26,11 +26,31 @@ All non-trivial decisions are documented as ADRs in [docs/adr](docs/adr).
 
 Measured on 12 × 5600 MHz, L1D 48 KiB, L2 1280 KiB, L3 18432 KiB. CPU governor set to `performance`. Release build (`-O3`).
 
-### Throughput
+### Latency distribution
+
+10,000 repetitions × 100 iterations. Each repetition reports mean time for its 100 iterations — approximates individual call latency. 64-byte payload, CPU governor set to `performance`.
+
+**Unpinned** (`./build/benchmarks/bench_append --benchmark_time_unit=ns`):
 
 ```
-BM_AppendSingleCacheLine   16.1 ns   3.70 GB/s   (1,048,576 iterations, 64-byte payload)
+median    5.1 ns    steady-state L1D-hot cost
+p99      12.6 ns    occasional L1D/L2 pressure
+p99.9     7,117 ns  OS scheduling / context switch
+p99.99    9,624 ns  rare preemption event
+p100      9,776 ns  worst single observation
 ```
+
+**Pinned to core 1** (`taskset -c 1 ./build/benchmarks/bench_append --benchmark_time_unit=ns`):
+
+```
+median    4.3 ns    steady-state L1D-hot cost
+p99       9.5 ns    occasional L1D/L2 pressure
+p99.9     6,566 ns  kernel interrupt / HT sibling interference
+p99.99    7,318 ns  kernel interrupt
+p100      7,721 ns  worst single observation
+```
+
+Pinning to a single core (`taskset`) reduces the tail ~25% by eliminating thread migration. The remaining ~7 µs tail is kernel interrupt overhead and hyperthreading interference — not the engine. Full elimination requires `isolcpus` + IRQ affinity pinned away from the isolated core, which is standard HFT production config but requires a kernel boot parameter (`isolcpus=1`).
 
 ### Profiling (`perf stat`)
 
@@ -48,18 +68,21 @@ Heap is flat at ~85 KB for the entire 1,048,576-iteration loop. The ~90 KB peak 
 
 ### Comparison with Java Phase 5
 
-The Java implementation ([distributed-messaging](https://github.com/alchevrier/distributed-messaging), Phase 5) uses `FileChannel` scatter-gather writes (one syscall per append: header slab + payload). Measured with JMH `SampleTime` on the same machine.
+The Java implementation ([distributed-messaging](https://github.com/alchevrier/distributed-messaging)) went through two phases. Phase 5 replaced `ByteBuffer.allocate()` + `HashMap<Long, Long>` with pre-allocated off-heap `MemorySegment` slabs — eliminating GC pauses at the cost of a small p50 regression. C++ mmap then eliminates the syscall boundary entirely.
 
-| | Java (Phase 5, post-fix) | C++ (mmap) |
-|---|---|---|
-| p50 | 4,432 ns | 16.1 ns (mean) |
-| p99 | 6,584 ns | — |
-| p99.99 | 70,519 ns | — |
-| Max GC pause | 2 ms | none |
+| | Java (baseline) | Java (Phase 5) | C++ (mmap) |
+|---|---|---|---|
+| p50 / median | 3,900 ns | 4,432 ns (+14%) | **5.1 ns** |
+| p99 | 6,500 ns | 6,584 ns (flat) | **12.6 ns** |
+| p99.99 | 306,000 ns | 70,519 ns (−77%) | **9,624 ns** † |
+| p100 | 40,000,000 ns | 11,993,000 ns (−70%) | **9,776 ns** † |
+| Max GC pause | 655 ms (growing) | 2 ms flat | none |
 
-> **Methodology note**: Java numbers are JMH `SampleTime` percentiles (individual call durations sampled and histogrammed). C++ is Google Benchmark mean throughput — percentiles require custom statistics and are not yet instrumented. The p99/p99.99 cells will be filled once percentile sampling is added to the benchmark harness.
+† C++ p99.9+ tail is OS scheduling jitter, not the engine. Eliminated by core pinning (`taskset`, `isolcpus`).
 
-The ~275× mean latency difference is the cost of a `FileChannel` syscall versus a `memcpy` into a mapped page. The JVM and GC are secondary — the bottleneck was the I/O model. Both implementations are allocation-free on the hot path in their respective Phase 5 form.
+> **Methodology**: Java numbers are JMH `SampleTime` on bare-metal Linux, JFR-confirmed. C++ numbers are Google Benchmark `ComputeStatistics` over 10,000 repetitions of 100 iterations each.
+
+The Phase 5 Java optimisation was the right move within the JVM — GC pauses eliminated, tail dramatically improved. The remaining gap to C++ is the syscall boundary: `FileChannel` crosses into the kernel on every write; `mmap` does not. The p50 difference (~870×) is that cost, nothing else.
 
 ## Test coverage
 
@@ -97,5 +120,5 @@ C++23 — CMake 3.28, Conan 2.27.1, GCC 13.3.0, Google Benchmark 1.9.1, GTest 1.
 
 ## Roadmap
 
-- **Wire SPSC queue into the pipeline** — decouple caller thread from the mmap write. The trading thread cost drops to a single `store(release)` into the ring buffer; a dedicated writer thread drains into `LogSegment`. Currently `LogManager::append()` is synchronous — the caller pays the 16 ns directly.
-- **Percentile benchmark statistics** — add p99/p99.99 via `benchmark::RegisterStatistics` to complete the comparison table with the Java Phase 5 numbers.
+- **Wire SPSC queue into the pipeline** — decouple caller thread from the mmap write. The trading thread cost drops to a single `store(release)` into the ring buffer; a dedicated writer thread drains into `LogSegment`. Currently `LogManager::append()` is synchronous — the caller pays the full append cost directly.
+- **`isolcpus` + IRQ affinity** — kernel boot parameter to fully isolate a core from the OS scheduler, eliminating the remaining ~7 µs tail visible in the pinned benchmark.
